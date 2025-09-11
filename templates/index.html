@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Text & Image Saver</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      margin: 0;
+      background: #f4f6f9;
+      color: #333;
+    }
+    header {
+      background: linear-gradient(135deg, #4a90e2, #007aff);
+      color: white;
+      padding: 15px 20px;
+      text-align: center;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    }
+    main {
+      display: flex;
+      flex-wrap: wrap;
+      padding: 20px;
+      gap: 20px;
+      max-width: 1000px;
+      margin: auto;
+    }
+    section {
+      flex: 1 1 450px;
+      background: white;
+      border-radius: 10px;
+      padding: 20px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+      transition: transform 0.2s ease;
+    }
+    section:hover {
+      transform: translateY(-3px);
+    }
+    h2 {
+      margin-top: 0;
+      font-size: 20px;
+      border-bottom: 2px solid #f0f0f0;
+      padding-bottom: 8px;
+    }
+    textarea {
+      width: 100%;
+      height: 220px;
+      font-size: 16px;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      resize: vertical;
+      outline: none;
+      transition: border 0.2s ease;
+    }
+    textarea:focus {
+      border-color: #4a90e2;
+    }
+    .upload-label {
+      display: inline-block;
+      margin-top: 15px;
+      background-color: #007aff;
+      color: white;
+      padding: 10px 15px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    .upload-label:hover {
+      background-color: #005bb5;
+    }
+    input[type="file"] {
+      display: none;
+    }
+    #imageContainer {
+      margin-top: 20px;
+      text-align: center;
+    }
+    #imageContainer img {
+      max-width: 100%;
+      max-height: 400px;
+      border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      cursor: zoom-in;
+      transition: transform 0.3s ease;
+    }
+    #imageContainer img:hover {
+      transform: scale(1.03);
+    }
+    .action-btn {
+      margin-top: 10px;
+      padding: 8px 12px;
+      font-size: 14px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    .remove-btn {
+      background-color: #e74c3c;
+      color: white;
+    }
+    .remove-btn:hover {
+      background-color: #c0392b;
+    }
+    @media (max-width: 768px) {
+      main {
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📝 Text & 📷 Image Saver</h1>
+  </header>
+  
+  <main>
+    <section>
+      <h2>Shared Text</h2>
+      <textarea id="sharedBox" placeholder="Start typing..."></textarea>
+    </section>
+
+    <section>
+      <h2>Image Upload</h2>
+      <label class="upload-label" for="fileInput">Upload Image</label>
+      <input type="file" id="fileInput" accept="image/*" />
+      <div id="imageContainer"></div>
+    </section>
+  </main>
+
+  <script>
+    const box = document.getElementById('sharedBox');
+    const fileInput = document.getElementById('fileInput');
+    const imageContainer = document.getElementById('imageContainer');
+
+    let saveTimeout = null;
+    let typingTimeout = null;
+    let isTyping = false;
+
+    async function fetchData() {
+      const res = await fetch('/get');
+      const data = await res.json();
+
+      // Only update textarea if user is not typing
+      if (!isTyping && data.text !== box.value) {
+        box.value = data.text || '';
+      }
+
+      imageContainer.innerHTML = '';
+      if (data.image) {
+        const img = document.createElement('img');
+        img.src = data.image; // Cloud Storage public URL
+        img.onclick = () => window.open(data.image, '_blank');
+        imageContainer.appendChild(img);
+
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '❌ Remove Image';
+        delBtn.className = 'action-btn remove-btn';
+        delBtn.onclick = async () => {
+          await fetch('/delete_image', { method: 'POST' });
+          fetchData();
+        };
+        imageContainer.appendChild(delBtn);
+      }
+    }
+
+    function scheduleTextSave() {
+      isTyping = true;
+
+      // Reset "isTyping" after 1s of no input
+      clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        isTyping = false;
+      }, 1000);
+
+      // Debounced save
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(() => {
+        fetch('/set', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: box.value })
+        });
+      }, 400);
+    }
+
+    async function handleFileUpload() {
+      const file = fileInput.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append('image', file);
+      await fetch('/upload_image', { method: 'POST', body: formData });
+      fileInput.value = '';
+      fetchData();
+    }
+
+    box.addEventListener('input', scheduleTextSave);
+    fileInput.addEventListener('change', handleFileUpload);
+    setInterval(fetchData, 2000); // polling
+    fetchData();
+  </script>
+</body>
+</html>
