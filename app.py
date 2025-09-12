@@ -1,39 +1,41 @@
 import os
-import psycopg2
 import hashlib
 import logging
-from flask import Flask, request, jsonify, make_response
+
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import psycopg  # psycopg3
 import cloudinary
 import cloudinary.uploader
 
-# Config constants
+# ---- Config constants ----
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 ALLOWED_MIMETYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
-# Flask app
+# ---- Flask app ----
 app = Flask(__name__)
 CORS(app)
-
 logging.basicConfig(level=logging.INFO)
 
-# Database config
+# ---- Database config ----
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-# Cloudinary config (set env vars)
+# ---- Cloudinary config ----
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
-# ---- DB helpers ----
+# ---- Database helpers ----
 def get_conn():
-    return psycopg2.connect(DB_URL)
+    """Return a psycopg3 connection."""
+    return psycopg.connect(DB_URL)
 
 def init_db():
+    """Create messages table and index if not exist."""
     try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("""
@@ -47,7 +49,6 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
-            # index for fast lookups
             cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_network_updated
             ON messages (network_id, updated_at DESC);
@@ -58,9 +59,9 @@ def init_db():
 
 init_db()
 
-# ---- Helper: generate network ID ----
+# ---- Helpers ----
 def get_network_id():
-    # Trust X-Forwarded-For header if present (common behind proxies)
+    """Generate a SHA256 hash ID based on client IP and local subnet."""
     public_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     if public_ip:
         public_ip = public_ip.split(",")[0].strip()
@@ -68,20 +69,17 @@ def get_network_id():
     raw_id = f"{public_ip}|{local_subnet}" if local_subnet else public_ip
     return hashlib.sha256(raw_id.encode()).hexdigest()
 
-# ---- Helpers for image validation & Cloudinary ----
 def validate_image_file(f):
+    """Check file size and type."""
     if not f:
-        return (False, "No file")
-    if hasattr(f, "content_length") and f.content_length is not None and f.content_length > MAX_IMAGE_BYTES:
-        return (False, "File too large")
-    # If content_length not present, read a bit (werkzeug/FileStorage may not expose)
-    # We will rely on the client & Cloudinary limits but still check mimetype:
+        return False, "No file"
+    if getattr(f, "content_length", 0) > MAX_IMAGE_BYTES:
+        return False, "File too large"
     if f.mimetype not in ALLOWED_MIMETYPES:
-        return (False, f"Unsupported image type: {f.mimetype}")
-    return (True, None)
+        return False, f"Unsupported image type: {f.mimetype}"
+    return True, None
 
 # ---- Routes ----
-
 @app.route("/send", methods=["POST"])
 def send_message():
     text = (request.form.get("text") or "").strip()
@@ -97,32 +95,31 @@ def send_message():
 
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            # fetch old public_id (but do NOT delete yet)
+            # Fetch old public_id
             cur.execute("SELECT public_id FROM messages WHERE network_id = %s", (network_id,))
             row = cur.fetchone()
             old_public_id = row[0] if (row and row[0]) else None
 
-            # If there is a new image, validate and upload first
+            # Handle new image
             if image_file:
                 ok, err = validate_image_file(image_file)
                 if not ok:
                     return jsonify({"success": False, "error": err}), 400
                 try:
-                    upload_result = cloudinary.uploader.upload(image_file)
-                    image_url = upload_result.get("secure_url")
-                    public_id = upload_result.get("public_id")
+                    result = cloudinary.uploader.upload(image_file)
+                    image_url = result.get("secure_url")
+                    public_id = result.get("public_id")
                 except Exception as e:
                     logging.error(f"Cloudinary upload failed: {e}")
                     return jsonify({"success": False, "error": "Image upload failed"}), 500
 
-                # At this point new image uploaded successfully; delete old image if present
                 if old_public_id:
                     try:
                         cloudinary.uploader.destroy(old_public_id)
                     except Exception as e:
                         logging.warning(f"Failed to destroy old Cloudinary id {old_public_id}: {e}")
 
-            # Upsert message: set owner_device_id to current device_id (so last-sender becomes owner)
+            # Upsert message
             cur.execute("""
                 INSERT INTO messages (network_id, text, image_url, public_id, owner_device_id, updated_at)
                 VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
@@ -183,22 +180,18 @@ def delete_message():
     device_id = request.headers.get("X-Device-ID") or None
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            # Get current record
             cur.execute("SELECT public_id, owner_device_id FROM messages WHERE network_id = %s", (network_id,))
             row = cur.fetchone()
             if not row:
                 return jsonify({"success": False, "error": "No message to delete"}), 404
 
             public_id, owner_device_id = row[0], row[1]
-            # Optional: Only allow delete if requester is the owner device (last-sender)
             if owner_device_id and device_id and owner_device_id != device_id:
-                return jsonify({"success": False, "error": "Not authorized to delete (not owner)"}), 403
+                return jsonify({"success": False, "error": "Not authorized"}), 403
 
-            # delete DB record
             cur.execute("DELETE FROM messages WHERE network_id = %s", (network_id,))
             conn.commit()
 
-            # Attempt to delete image in Cloudinary if exists
             if public_id:
                 try:
                     cloudinary.uploader.destroy(public_id)
@@ -210,10 +203,10 @@ def delete_message():
         logging.error(f"DB error in /delete: {e}")
         return jsonify({"success": False, "error": "Database error"}), 500
 
-# Simple health endpoint
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
 
+# ---- Run ----
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
