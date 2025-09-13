@@ -47,31 +47,27 @@
 <div id="status">Initializing...</div>
 
 <script>
-/* ----------------------------
-  device id management
----------------------------- */
-function getDeviceId() {
+/* ---------- device id ---------- */
+function getDeviceId(){
   let id = localStorage.getItem("device_id_v1");
-  if (!id) { id = crypto.randomUUID(); localStorage.setItem("device_id_v1", id); }
+  if(!id){ id = crypto.randomUUID(); localStorage.setItem("device_id_v1", id); }
   return id;
 }
 const DEVICE_ID = getDeviceId();
 
-/* ----------------------------
-  detect local subnet using WebRTC trick
----------------------------- */
-async function getLocalSubnet() {
-  return new Promise(resolve => {
+/* ---------- detect local subnet (WebRTC) ---------- */
+async function getLocalSubnet(){
+  return new Promise(resolve=>{
     const pc = new RTCPeerConnection({iceServers:[]});
     pc.createDataChannel("");
-    pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(()=>{});
+    pc.createOffer().then(offer=>pc.setLocalDescription(offer)).catch(()=>{});
     pc.onicecandidate = ev => {
       if(ev?.candidate?.candidate){
         const parts = ev.candidate.candidate.split(" ");
         const addr = parts[4];
         if(/^(192\.|10\.|172\.)/.test(addr)){
           resolve(addr.split(".").slice(0,3).join("."));
-          pc.close();
+          try{ pc.close(); }catch(e){}
         }
       }
     };
@@ -79,9 +75,7 @@ async function getLocalSubnet() {
   });
 }
 
-/* ----------------------------
-  UI wiring & polling
----------------------------- */
+/* ---------- UI wiring ---------- */
 const sharedBox = document.getElementById("sharedBox");
 const fileInput = document.getElementById("fileInput");
 const imageContainer = document.getElementById("imageContainer");
@@ -90,109 +84,129 @@ const imageMeta = document.getElementById("imageMeta");
 const status = document.getElementById("status");
 
 let localSubnet = null;
-let isTyping = false;
 let typingTimer = null;
+let isTyping = false;
 
-async function init() {
-  status.textContent = "Detecting network...";
-  localSubnet = await getLocalSubnet();
-  status.textContent = "Ready";
-  startPolling();
-}
-init();
-
-function buildHeaders() {
-  const h = {"X-Device-ID": DEVICE_ID};
-  if(localSubnet) h["X-Local-Subnet"]=localSubnet;
+function buildHeaders(){
+  const h = { "X-Device-ID": DEVICE_ID };
+  if(localSubnet) h["X-Local-Subnet"] = localSubnet;
   return h;
 }
 
-async function fetchLatest() {
-  try {
-    const res = await fetch("/get",{headers:buildHeaders()});
+async function fetchLatest(){
+  try{
+    const res = await fetch("/get", { headers: buildHeaders() });
     if(!res.ok){
       const err = await res.json().catch(()=>({error:'unknown'}));
-      status.textContent = `Sync error: ${err.error||res.status}`;
+      status.textContent = `Sync error: ${err.error || res.status}`;
       return null;
     }
     const data = await res.json();
-    if(!data.success){ status.textContent="No data"; return null; }
-    status.textContent="Synced";
+    if(!data.success){ status.textContent = "No data"; return null; }
+    status.textContent = "Synced";
     return data;
-  }catch(e){ console.error(e); status.textContent="Offline"; return null; }
+  }catch(e){ console.error(e); status.textContent = "Offline"; return null; }
 }
 
-async function refreshUI() {
+function formatTS(ts){ return ts ? new Date(ts).toLocaleString() : ""; }
+
+async function refreshUI(){
   const data = await fetchLatest();
   if(!data) return;
 
-  if(!isTyping && (data.text||"")!==sharedBox.value) sharedBox.value=data.text||"";
-  textMeta.textContent = data.updated_at?`Updated: ${new Date(data.updated_at).toLocaleString()}`:"";
+  if(!isTyping && (data.text||"") !== sharedBox.value){
+    sharedBox.value = data.text || "";
+  }
+  textMeta.textContent = data.updated_at ? `Updated: ${formatTS(data.updated_at)}` : "";
 
-  imageContainer.innerHTML="";
+  // image area
+  imageContainer.innerHTML = "";
   if(data.image_url){
-    const img=document.createElement("img");
-    img.src=data.image_url; img.className="preview"; img.onclick=()=>window.open(data.image_url,"_blank");
+    const img = document.createElement("img");
+    img.src = data.image_url; img.className="preview"; img.onclick = ()=>window.open(data.image_url, "_blank");
     imageContainer.appendChild(img);
 
-    const owner=data.owner_device_id;
-    const showDelete=!owner||owner===DEVICE_ID;
-    if(showDelete){
-      const btn=document.createElement("button");
-      btn.textContent="❌ Remove Image"; btn.className="action-btn remove-btn";
-      btn.onclick=async()=>{ await deleteMessage(); await refreshUI(); };
+    // Delete allowed only if owner_device_id matches (or if null)
+    const owner = data.owner_device_id;
+    const canDelete = !owner || owner === DEVICE_ID;
+    if(canDelete){
+      const btn = document.createElement("button");
+      btn.textContent = "❌ Remove Image";
+      btn.className = "action-btn remove-btn";
+      btn.onclick = async ()=>{
+        await deleteImage();
+        await refreshUI();
+      };
       imageContainer.appendChild(btn);
     }
-    imageMeta.textContent=`Updated: ${new Date(data.updated_at).toLocaleString()}`;
-  } else { imageMeta.textContent=""; }
+    imageMeta.textContent = data.updated_at ? `Updated: ${formatTS(data.updated_at)}` : "";
+  } else {
+    imageMeta.textContent = "";
+  }
 }
 
-async function sendMessage({text=null,imageFile=null}={}) {
-  try {
-    const fd=new FormData();
-    if(text!==null) fd.append("text",text);
-    if(imageFile) fd.append("image",imageFile);
-    const res=await fetch("/send",{method:"POST",body:fd,headers:buildHeaders()});
-    if(!res.ok){ const err=await res.json().catch(()=>({error:'unknown'})); alert("Save failed: "+(err.error||res.status)); return null;}
-    const data=await res.json(); if(!data.success) alert("Save failed: "+(data.error||"unknown"));
+async function sendText(text){
+  try{
+    const res = await fetch("/set", {
+      method: "POST",
+      headers: Object.assign({"Content-Type": "application/json"}, buildHeaders()),
+      body: JSON.stringify({ text })
+    });
+    if(!res.ok){ const err = await res.json().catch(()=>({error:'unknown'})); console.error("Save failed", err); return; }
+    const data = await res.json();
+    if(!data.success) console.error("Save failed", data.error);
+  }catch(e){ console.error("sendText error", e); }
+}
+
+async function uploadImageFile(file){
+  try{
+    const fd = new FormData();
+    fd.append("image", file);
+    const res = await fetch("/upload_image", { method: "POST", headers: buildHeaders(), body: fd });
+    if(!res.ok){ const err = await res.json().catch(()=>({error:'unknown'})); alert("Upload failed: "+(err.error||res.status)); return; }
+    const data = await res.json();
+    if(!data.success) alert("Upload failed: "+(data.error||"unknown"));
     return data;
-  }catch(e){ console.error(e); alert("Send failed"); return null; }
+  }catch(e){ console.error("uploadImageFile", e); alert("Upload error"); }
 }
 
-async function deleteMessage() {
-  try {
-    const res=await fetch("/delete",{method:"DELETE",headers:buildHeaders()});
-    if(!res.ok){ const err=await res.json().catch(()=>({error:'unknown'})); alert("Delete failed: "+(err.error||res.status)); return;}
-    const data=await res.json(); if(!data.success) alert("Delete failed: "+(data.error||"unknown"));
-  }catch(e){ console.error(e); alert("Delete failed"); }
+async function deleteImage(){
+  try{
+    const res = await fetch("/delete_image", { method: "POST", headers: buildHeaders() });
+    if(!res.ok){ const err = await res.json().catch(()=>({error:'unknown'})); alert("Delete failed: "+(err.error||res.status)); return; }
+    const data = await res.json();
+    if(!data.success) alert("Delete failed: "+(data.error||"unknown"));
+  }catch(e){ console.error("deleteImage", e); alert("Delete error"); }
 }
 
-let pollHandle=null;
-function startPolling(){ refreshUI(); if(pollHandle) clearInterval(pollHandle); pollHandle=setInterval(refreshUI,3000); }
-
-sharedBox.addEventListener("input",()=>{
-  isTyping=true;
+/* ---- events ---- */
+sharedBox.addEventListener("input", ()=>{
+  isTyping = true;
   clearTimeout(typingTimer);
-  typingTimer=setTimeout(async()=>{ isTyping=false; await sendMessage({text:sharedBox.value}); },600);
+  typingTimer = setTimeout(async ()=>{
+    isTyping = false;
+    await sendText(sharedBox.value);
+  }, 600);
 });
 
-fileInput.addEventListener("change",async(e)=>{
-  const f=e.target.files[0]; if(!f) return;
-  if(f.size>(5*1024*1024)){ alert("Image too large (max 5 MB)"); return;}
-  if(!/^image\//.test(f.type)){ alert("Please upload an image"); return;}
-  await sendMessage({imageFile:f});
-  fileInput.value=""; await refreshUI();
+fileInput.addEventListener("change", async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  if(f.size > (5 * 1024 * 1024)){ alert("Image too large (max 5 MB)"); return; }
+  if(!/^image\//.test(f.type)){ alert("Please upload an image file"); return; }
+  await uploadImageFile(f);
+  fileInput.value = "";
+  await refreshUI();
 });
 
-/* Manual Delete All button if owner */
-const removeAllBtn=document.createElement("button");
-removeAllBtn.textContent="Delete All (if owner)";
-removeAllBtn.className="action-btn remove-btn";
-removeAllBtn.onclick=async()=>{
-  if(!confirm("Delete the shared message and image for this network?")) return;
-  await deleteMessage(); await refreshUI();
-};
-document.querySelector("main section:nth-child(2)").appendChild(removeAllBtn);
+/* ---------- init ---------- */
+(async function init(){
+  status.textContent = "Detecting subnet...";
+  localSubnet = await getLocalSubnet();
+  status.textContent = "Ready";
+  await refreshUI();
+  setInterval(refreshUI, 3000);
+})();
 </script>
 </body>
 </html>
