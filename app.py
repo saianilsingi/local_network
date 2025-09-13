@@ -2,7 +2,7 @@ import os
 import hashlib
 import psycopg
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 import cloudinary
 import cloudinary.uploader
 import logging
@@ -29,25 +29,25 @@ cloudinary.config(
 def get_conn():
     return psycopg.connect(
         host=DB_HOST, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASS, port=DB_PORT
+        user=DB_USER, password=DB_PASS, port=DB_PORT,
+        autocommit=True  # ✅ auto-commit enabled
     )
 
 def init_db():
-    q = """
-    CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        network_id VARCHAR(128) UNIQUE NOT NULL,
-        text TEXT,
-        image_url TEXT,
-        public_id TEXT,
-        owner_device_id VARCHAR(128),
-        updated_at TIMESTAMP DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_network_id ON messages (network_id);
-    """
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(q)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                network_id VARCHAR(128) UNIQUE NOT NULL,
+                text TEXT,
+                image_url TEXT,
+                public_id TEXT,
+                owner_device_id VARCHAR(128),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_network_id ON messages (network_id);")
     except Exception as e:
         logging.error("DB init error: %s", e)
 
@@ -65,7 +65,6 @@ def get_local_subnet():
     return request.headers.get("X-Local-Subnet")
 
 def make_network_id(public_ip, local_subnet):
-    # privacy: hash the hybrid key (public_ip + '|' + local_subnet)
     raw = f"{public_ip}|{local_subnet}" if local_subnet else f"{public_ip}|"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -79,6 +78,10 @@ def iso_or_none(dt):
     return dt.isoformat() if dt else None
 
 # --- Routes ---
+
+@app.route("/ping")
+def ping():
+    return jsonify({"status": "ok"})  # ✅ health check route
 
 @app.route("/get", methods=["GET"])
 def get_message():
@@ -102,7 +105,7 @@ def get_message():
                 "owner_device_id": owner_device_id,
                 "updated_at": iso_or_none(updated_at)
             })
-    except Exception as e:
+    except Exception:
         logging.exception("DB error in /get")
         return jsonify({"success": False, "error": "Database error"}), 500
 
@@ -143,16 +146,15 @@ def upload_image():
     if file.filename == '':
         return jsonify({"success": False, "error": "Empty filename"}), 400
 
-    # create a safe public_id; include network hash and timestamp for uniqueness
     safe_name = secure_filename(file.filename)
     timestamp = int(datetime.utcnow().timestamp() * 1000)
-    # don't leak raw network info in public_id: use network_id hash
     pub_id = f"{network_id[:16]}_{timestamp}_{safe_name}"
+
     try:
         upload_result = cloudinary.uploader.upload(file, public_id=pub_id, overwrite=True)
         public_url = upload_result.get("secure_url")
         public_id = upload_result.get("public_id")
-    except Exception as e:
+    except Exception:
         logging.exception("Cloudinary upload failed")
         return jsonify({"success": False, "error": "Image upload failed"}), 500
 
@@ -170,9 +172,8 @@ def upload_image():
         return jsonify({"success": True, "image_url": public_url, "public_id": public_id})
     except Exception:
         logging.exception("DB error in /upload_image")
-        # attempt best-effort cleanup of uploaded image to avoid orphan
         try:
-            cloudinary.uploader.destroy(public_id)
+            cloudinary.uploader.destroy(public_id)  # cleanup orphan
         except Exception:
             pass
         return jsonify({"success": False, "error": "Database error"}), 500
@@ -187,23 +188,18 @@ def delete_image():
             cur.execute("SELECT public_id, owner_device_id FROM messages WHERE network_id = %s", (network_id,))
             row = cur.fetchone()
             if not row or not row[0]:
-                # nothing to delete
                 cur.execute("UPDATE messages SET image_url = NULL, public_id = NULL, updated_at = NOW() WHERE network_id = %s", (network_id,))
                 return jsonify({"success": True, "deleted": False})
 
             public_id, owner_device = row
-
-            # If owner_device exists, enforce delete by owner only (optional)
             if owner_device and device_id and owner_device != device_id:
                 return jsonify({"success": False, "error": "Only owner may delete image"}), 403
 
-            # delete from Cloudinary (best-effort)
             try:
                 cloudinary.uploader.destroy(public_id)
             except Exception as e:
                 logging.warning("Cloudinary delete failed for %s: %s", public_id, e)
 
-            # clear DB fields
             cur.execute("""
                 UPDATE messages SET image_url = NULL, public_id = NULL, updated_at = NOW()
                 WHERE network_id = %s
@@ -213,10 +209,9 @@ def delete_image():
         logging.exception("DB error in /delete_image")
         return jsonify({"success": False, "error": "Database error"}), 500
 
-# keep a simple index if you want to serve index.html from Flask templates
 @app.route("/")
 def index():
-    return app.send_static_file("index.html")  # or render_template if using templates/
+    return render_template("index.html")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
