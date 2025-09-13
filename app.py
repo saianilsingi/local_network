@@ -1,6 +1,6 @@
 import os
 import hashlib
-import psycopg2
+import psycopg
 from datetime import datetime
 from flask import Flask, request, jsonify
 import cloudinary
@@ -27,7 +27,7 @@ cloudinary.config(
 
 # --- DB helpers ---
 def get_conn():
-    return psycopg2.connect(
+    return psycopg.connect(
         host=DB_HOST, dbname=DB_NAME,
         user=DB_USER, password=DB_PASS, port=DB_PORT
     )
